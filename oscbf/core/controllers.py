@@ -298,6 +298,7 @@ class PositionTaskTorqueController:
         kd_joint (ArrayLike): Joint-space derivative gain(s), shape (n_joints,)
         tau_min (Optional[ArrayLike]): Minimum joint torques, shape (n_joints,)
         tau_max (Optional[ArrayLike]): Maximum joint torques, shape (n_joints,)
+        damping (float): Nonnegative damping for the task inertia inverse. Defaults to zero.
     """
 
     def __init__(
@@ -309,7 +310,11 @@ class PositionTaskTorqueController:
         kd_joint: ArrayLike,
         tau_min: Optional[ArrayLike],
         tau_max: Optional[ArrayLike],
+        damping: float = 0.,
     ):
+        if damping < 0:
+            raise ValueError("damping must be nonnegative")
+        self.damping = float(damping)
         self.dim_space = 3  # 3D
         self.dim_task = 3  # Position in 3D
         assert isinstance(n_joints, int)
@@ -390,7 +395,7 @@ class PositionTaskTorqueController:
 
         # Operational space matrices
         task_inertia_inv = Jv @ M_inv @ Jv.T
-        task_inertia = jnp.linalg.inv(task_inertia_inv)
+        task_inertia = jnp.linalg.inv(task_inertia_inv + self.damping**2 * jnp.eye(3))
         J_bar = M_inv @ Jv.T @ task_inertia
 
         # Compute operational space task torques
@@ -427,6 +432,7 @@ class PositionTaskVelocityController:
         kp_joint (ArrayLike): Joint-space proportional gain(s), shape (n_joints,)
         qdot_min (Optional[ArrayLike]): Minimum joint velocities, shape (n_joints,)
         qdot_max (Optional[ArrayLike]): Maximum joint velocities, shape (n_joints,)
+        damping (float): Nonnegative damping for the mass-weighted inverse. Defaults to zero.
     """
 
     def __init__(
@@ -436,7 +442,11 @@ class PositionTaskVelocityController:
         kp_joint: ArrayLike,
         qdot_min: Optional[ArrayLike],
         qdot_max: Optional[ArrayLike],
+        damping: float = 0.,
     ):
+        if damping < 0:
+            raise ValueError("damping must be nonnegative")
+        self.damping = float(damping)
         self.dim_space = 3  # 3D
         self.dim_task = 3  # Position in 3D
         assert isinstance(n_joints, int)
@@ -492,7 +502,7 @@ class PositionTaskVelocityController:
             J_hash = jnp.linalg.pinv(Jv)  # "J pseudo"
         else:
             task_inertia_inv = Jv @ M_inv @ Jv.T
-            task_inertia = jnp.linalg.inv(task_inertia_inv)
+            task_inertia = jnp.linalg.inv(task_inertia_inv + self.damping**2 * jnp.eye(3))
             J_hash = M_inv @ Jv.T @ task_inertia  # "J bar"
 
         # Compute task velocities

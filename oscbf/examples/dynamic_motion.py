@@ -22,9 +22,15 @@ from oscbf.core.manipulation_env import FrankaTorqueControlEnv, FrankaVelocityCo
 from oscbf.core.nero_control import MIT_LIMIT
 from oscbf.core.oscbf_configs import OSCBFTorqueConfig, OSCBFVelocityConfig
 from oscbf.utils.trajectory import SinusoidalTaskTrajectory
+from oscbf.utils.visualization import visualize_3D_sphere
+from oscbf.examples.nero_workspace import (
+    geometry_margins, manual_torque_control, manual_velocity_control, PostureRecovery,
+)
 from oscbf.core.controllers import (
     PoseTaskTorqueController,
     PoseTaskVelocityController,
+    PositionTaskTorqueController,
+    PositionTaskVelocityController,
 )
 
 DATA_DIR = "oscbf/experiments/data/"
@@ -33,6 +39,29 @@ PAUSE_FOR_PICTURES = False
 RECORD_VIDEO = False
 PICTURE_IDXS = [1000, 1250, 1600, 1900, 2200]
 PANDA_POSTURE = (0., -np.pi / 6, 0., -3 * np.pi / 4, 0., 5 * np.pi / 9, 0.)
+
+
+# Keep the flange TCP 1 mm inside the requested 700 mm radial limit.
+MANUAL_RADIUS = 0.699
+MANUAL_MIN = np.array([-0.470, -0.250, 0.150])
+MANUAL_MAX = np.array([0.470, 0.250, 0.570])
+BLUE_SPHERE_CENTER = np.array([-0.300, 0.000, 0.250])
+BLUE_SPHERE_RADIUS = 0.035
+# Start near (-400, -100, 400) mm with clearance from the blue obstacle.
+MANUAL_POSTURE = (0.06657889, 0.39073832, 0.30844563, 1.28576442,
+                  -0.31945470, 0.47671622, 0.04082224)
+
+
+def position_margins(robot, q, pos_min, pos_max, radius):
+    pos = robot.ee_position(q)
+    margins = jnp.concatenate([pos_max - pos, pos - pos_min])
+    if radius is not None:
+        margins = jnp.concatenate([
+            margins,
+            jnp.atleast_1d(radius - jnp.linalg.norm(pos)),
+            geometry_margins(robot, q, pos_min, pos_max, BLUE_SPHERE_CENTER, BLUE_SPHERE_RADIUS),
+        ])
+    return margins
 
 
 @jax.tree_util.register_static
@@ -45,7 +74,9 @@ class EESafeSetTorqueConfig(OSCBFTorqueConfig):
         pos_max: ArrayLike,
         compensate_centrifugal_coriolis: bool,
         torque_limits=None,
+        radius=None,
     ):
+        self.radius = radius
         self.pos_min = np.asarray(pos_min)
         self.pos_max = np.asarray(pos_max)
         super().__init__(
@@ -55,8 +86,15 @@ class EESafeSetTorqueConfig(OSCBFTorqueConfig):
 
     def h_2(self, z, **kwargs):
         q = z[: self.num_joints]
-        ee_pos = self.robot.ee_position(q)
-        return jnp.concatenate([self.pos_max - ee_pos, ee_pos - self.pos_min])
+        return position_margins(self.robot, q, self.pos_min, self.pos_max, self.radius)
+
+    def _P(self, z, **kwargs):
+        if self.radius is None:
+            return super()._P(z, **kwargs)
+        q = z[:self.num_joints]
+        M_inv = jnp.linalg.inv(self.robot.mass_matrix(q))
+        J = self.robot.ee_jacobian(q)[:3]
+        return M_inv.T @ (J.T @ J + 0.01 * jnp.eye(self.num_joints)) @ M_inv
 
     def alpha(self, h):
         return 10.0 * h
@@ -68,15 +106,21 @@ class EESafeSetTorqueConfig(OSCBFTorqueConfig):
 @jax.tree_util.register_static
 class EESafeSetVelocityConfig(OSCBFVelocityConfig):
 
-    def __init__(self, robot: Manipulator, pos_min: ArrayLike, pos_max: ArrayLike):
+    def __init__(self, robot: Manipulator, pos_min: ArrayLike, pos_max: ArrayLike, radius=None):
+        self.radius = radius
         self.pos_min = np.asarray(pos_min)
         self.pos_max = np.asarray(pos_max)
         super().__init__(robot)
 
     def h_1(self, z, **kwargs):
         q = z[: self.num_joints]
-        ee_pos = self.robot.ee_position(q)
-        return jnp.concatenate([self.pos_max - ee_pos, ee_pos - self.pos_min])
+        return position_margins(self.robot, q, self.pos_min, self.pos_max, self.radius)
+
+    def _P(self, z, **kwargs):
+        if self.radius is None:
+            return super()._P(z, **kwargs)
+        J = self.robot.ee_jacobian(z)[:3]
+        return J.T @ J + 0.01 * jnp.eye(self.num_joints)
 
     def alpha(self, h):
         return 10.0 * h
@@ -150,9 +194,10 @@ def compute_velocity_control(
 
 
 class ManualTarget:
-    """Three base-frame displacement sliders for the red target."""
+    """Base-frame target coordinates for Nero, relative displacements otherwise."""
 
-    def __init__(self, env, origin, orientation):
+    def __init__(self, env, origin, orientation, base_coordinates=False):
+        self.base_coordinates = base_coordinates
         self.env = env
         self.origin = np.asarray(origin)
         self.position = self.origin.copy()
@@ -163,15 +208,25 @@ class ManualTarget:
                         client.COV_ENABLE_SEGMENTATION_MARK_PREVIEW):
             client.configureDebugVisualizer(preview, 0)
         self.sliders = []
-        for axis, width in zip("XYZ", env.xyz_max - env.xyz_min):
-            limit_mm = 1000 * width
+        widths = env.xyz_max - env.xyz_min
+        lower, upper = -widths, widths
+        initial = np.zeros(3)
+        label = "Target"
+        if base_coordinates:
+            # Allow the requested target beyond each TCP workspace face.
+            lower, upper = env.xyz_min - 0.100, env.xyz_max + 0.100
+            initial = self.origin
+            label = "Base"
+        for axis, low, high, value in zip("XYZ", lower, upper, initial):
             self.sliders.append(client.addUserDebugParameter(
-                f"Target {axis} (mm)", -limit_mm, limit_mm, 0.
+                f"{label} {axis} (mm)", 1000 * low, 1000 * high, 1000 * value
             ))
 
     def read(self):
-        offsets_mm = np.array([self.env.client.readUserDebugParameter(i) for i in self.sliders])
-        goal = self.origin + 0.001 * offsets_mm
+        coordinates_mm = np.array([self.env.client.readUserDebugParameter(i) for i in self.sliders])
+        goal = 0.001 * coordinates_mm
+        if not self.base_coordinates:
+            goal = self.origin + goal
         delta = goal - self.position
         # Limit target speed even when a slider moves from end to end in one frame.
         distance = np.linalg.norm(delta)
@@ -195,13 +250,15 @@ def main(control_method="torque", robot_name="panda", headless=False, steps=None
     if target == "manual" and headless:
         raise ValueError("Manual target sliders require a PyBullet GUI")
 
+    wide_manual = robot_name == "nero" and target == "manual"
+    radius = MANUAL_RADIUS if wide_manual else None
     if robot_name == "nero":
         robot = load_nero()
-        posture = NERO_READY
+        posture = MANUAL_POSTURE if wide_manual else NERO_READY
         tf = np.asarray(robot.ee_transform(np.asarray(posture)))
         origin, orientation = tf[:3, 3], tf[:3, :3]
         half_width = np.array([0.04, 0.08, 0.08])
-        pos_min, pos_max = origin - half_width, origin + half_width
+        pos_min, pos_max = (MANUAL_MIN, MANUAL_MAX) if wide_manual else (origin - half_width, origin + half_width)
         amplitude = (0.08, 0, 0)
         torque_limits = MIT_LIMIT
         camera_target = origin * 0.5
@@ -214,13 +271,13 @@ def main(control_method="torque", robot_name="panda", headless=False, steps=None
         torque_limits = None
         camera_target = (0.44, 0.16, 0.28)
 
-    compensate_centrifugal_coriolis = False
+    compensate_centrifugal_coriolis = wide_manual
     if control_method == "torque":
         config = EESafeSetTorqueConfig(
-            robot, pos_min, pos_max, compensate_centrifugal_coriolis, torque_limits
+            robot, pos_min, pos_max, compensate_centrifugal_coriolis, torque_limits, radius
         )
     else:
-        config = EESafeSetVelocityConfig(robot, pos_min, pos_max)
+        config = EESafeSetVelocityConfig(robot, pos_min, pos_max, radius)
     cbf = CBF.from_config(config)
     traj = SinusoidalTaskTrajectory(
         init_pos=origin, init_rot=orientation, amplitude=amplitude,
@@ -239,6 +296,12 @@ def main(control_method="torque", robot_name="panda", headless=False, steps=None
     else:
         env_type = FrankaTorqueControlEnv if control_method == "torque" else FrankaVelocityControlEnv
         env = env_type(**env_options)
+
+    if wide_manual:
+        visualize_3D_sphere(
+            BLUE_SPHERE_CENTER, BLUE_SPHERE_RADIUS, rgba=(0.1, 0.25, 0.95, 1.),
+            client=env.client,
+        )
 
     env.client.resetDebugVisualizerCamera(
         cameraDistance=1.00, cameraYaw=12, cameraPitch=-2.6, cameraTargetPosition=camera_target
@@ -271,8 +334,22 @@ def main(control_method="torque", robot_name="panda", headless=False, steps=None
         qdot_max=None,
     )
 
+    position_torque_controller = PositionTaskTorqueController(
+        robot.num_joints, 50., 20., 10., 5., None, None, damping=0.02,
+    )
+    position_velocity_controller = PositionTaskVelocityController(
+        robot.num_joints, 20., 10., None, None, damping=0.02,
+    )
+
+    def constraints(q):
+        return position_margins(robot, q, jnp.asarray(pos_min), jnp.asarray(pos_max), radius)
+
     @jax.jit
-    def compute_torque_control_jit(z, z_ee_des):
+    def compute_torque_control_jit(z, z_ee_des, recovery_posture):
+        if wide_manual:
+            return manual_torque_control(
+                robot, position_torque_controller, cbf, z, z_ee_des, constraints, recovery_posture,
+            )
         return compute_torque_control(
             robot,
             osc_torque_controller,
@@ -284,7 +361,11 @@ def main(control_method="torque", robot_name="panda", headless=False, steps=None
         )
 
     @jax.jit
-    def compute_velocity_control_jit(z, z_ee_des):
+    def compute_velocity_control_jit(z, z_ee_des, recovery_posture):
+        if wide_manual:
+            return manual_velocity_control(
+                robot, position_velocity_controller, cbf, z[:robot.num_joints], z_ee_des, constraints, recovery_posture,
+            )
         return compute_velocity_control(
             robot, osc_velocity_controller, cbf, z, z_ee_des, posture
         )
@@ -296,17 +377,19 @@ def main(control_method="torque", robot_name="panda", headless=False, steps=None
     else:
         raise ValueError(f"Invalid control method: {control_method}")
 
+    recovery = PostureRecovery(robot, constraints, posture) if wide_manual else None
     read_target = env.get_desired_ee_state
     if target == "manual":
-        read_target = ManualTarget(env, origin, orientation).read
-        print("Move Target X/Y/Z (mm) in the PyBullet Parameters panel.", flush=True)
+        read_target = ManualTarget(env, origin, orientation, base_coordinates=wide_manual).read
+        print("Move the X/Y/Z (mm) sliders in the PyBullet Parameters panel.", flush=True)
 
     reference_excess = 0.0
     flange_excess = 0.0
     min_x, max_x = np.inf, -np.inf
 
-    def box_excess(pos):
-        return max(0., np.max(pos_min - pos), np.max(pos - pos_max))
+    def workspace_excess(pos):
+        radial_excess = np.linalg.norm(pos) - radius if radius is not None else 0.
+        return max(0., radial_excess, np.max(pos_min - pos), np.max(pos - pos_max))
 
     try:
         iterations = count() if steps is None else range(steps)
@@ -315,7 +398,8 @@ def main(control_method="torque", robot_name="panda", headless=False, steps=None
                 break
             state = env.get_joint_state()
             desired = read_target()
-            command = np.asarray(compute_control(state, desired))
+            recovery_posture = recovery.update(state, desired, env.t) if recovery else np.asarray(posture)
+            command = np.asarray(compute_control(state, desired, recovery_posture))
             if not np.isfinite(command).all():
                 raise RuntimeError(f"Nonfinite {control_method} command at t={env.t:.3f} s")
             env.apply_control(command)
@@ -325,10 +409,10 @@ def main(control_method="torque", robot_name="panda", headless=False, steps=None
                 if not np.isfinite(flange).all():
                     raise RuntimeError(f"Nonfinite flange position at t={env.t:.3f} s")
                 min_x, max_x = min(min_x, flange[0]), max(max_x, flange[0])
-                reference_excess = max(reference_excess, box_excess(desired[:3]))
-                flange_excess = max(flange_excess, box_excess(flange))
+                reference_excess = max(reference_excess, workspace_excess(desired[:3]))
+                flange_excess = max(flange_excess, workspace_excess(flange))
         if min_x <= max_x:
-            print(f"{robot_name} {control_method}, {env.t:.3f} s: max distance outside a box face "
+            print(f"{robot_name} {control_method}, {env.t:.3f} s: max workspace violation "
                   f"(target / flange) = {reference_excess * 1000:.3f} / {flange_excess * 1000:.3f} mm, "
                   f"flange x travel = {(max_x - min_x) * 1000:.2f} mm")
     finally:
