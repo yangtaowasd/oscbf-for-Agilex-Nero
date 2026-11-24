@@ -8,7 +8,7 @@ limits, so the full-order (torque-control) OSCBF should perform better in this c
 """
 
 import argparse
-from functools import partial
+from itertools import count
 
 import numpy as np
 import jax
@@ -17,8 +17,9 @@ from jax.typing import ArrayLike
 
 
 from cbfpy import CBF
-from oscbf.core.manipulator import Manipulator, load_panda
-from oscbf.core.manipulation_env import FrankaTorqueControlEnv, FrankaVelocityControlEnv
+from oscbf.core.manipulator import Manipulator, NERO_FLANGE_URDF, NERO_READY, load_nero, load_panda
+from oscbf.core.manipulation_env import FrankaTorqueControlEnv, FrankaVelocityControlEnv, ManipulationEnv
+from oscbf.core.nero_control import MIT_LIMIT
 from oscbf.core.oscbf_configs import OSCBFTorqueConfig, OSCBFVelocityConfig
 from oscbf.utils.trajectory import SinusoidalTaskTrajectory
 from oscbf.core.controllers import (
@@ -31,6 +32,7 @@ SAVE_DATA = False
 PAUSE_FOR_PICTURES = False
 RECORD_VIDEO = False
 PICTURE_IDXS = [1000, 1250, 1600, 1900, 2200]
+PANDA_POSTURE = (0., -np.pi / 6, 0., -3 * np.pi / 4, 0., 5 * np.pi / 9, 0.)
 
 
 @jax.tree_util.register_static
@@ -42,11 +44,13 @@ class EESafeSetTorqueConfig(OSCBFTorqueConfig):
         pos_min: ArrayLike,
         pos_max: ArrayLike,
         compensate_centrifugal_coriolis: bool,
+        torque_limits=None,
     ):
         self.pos_min = np.asarray(pos_min)
         self.pos_max = np.asarray(pos_max)
         super().__init__(
-            robot, compensate_centrifugal_coriolis=compensate_centrifugal_coriolis
+            robot, compensate_centrifugal_coriolis=compensate_centrifugal_coriolis,
+            torque_limits=torque_limits,
         )
 
     def h_2(self, z, **kwargs):
@@ -89,6 +93,7 @@ def compute_torque_control(
     compensate_centrifugal_coriolis: bool,
     z: ArrayLike,
     z_ee_des: ArrayLike,
+    posture=PANDA_POSTURE,
 ):
     q = z[: robot.num_joints]
     qdot = z[robot.num_joints :]
@@ -96,19 +101,6 @@ def compute_torque_control(
 
     if not compensate_centrifugal_coriolis:
         c = jnp.zeros(robot.num_joints)
-
-    # Set nullspace desired joint position
-    nullspace_posture_goal = jnp.array(
-        [
-            0.0,
-            -jnp.pi / 6,
-            0.0,
-            -3 * jnp.pi / 4,
-            0.0,
-            5 * jnp.pi / 9,
-            0.0,
-        ]
-    )
 
     # Compute nominal control
     u_nom = osc_controller(
@@ -122,7 +114,7 @@ def compute_torque_control(
         des_omega=z_ee_des[15:18],
         des_accel=jnp.zeros(3),
         des_alpha=jnp.zeros(3),
-        des_q=nullspace_posture_goal,
+        des_q=jnp.asarray(posture),
         des_qdot=jnp.zeros(robot.num_joints),
         J=J,
         M=M,
@@ -141,6 +133,7 @@ def compute_velocity_control(
     cbf: CBF,
     z: ArrayLike,
     z_ee_des: ArrayLike,
+    posture=PANDA_POSTURE,
 ):
     q = z[: robot.num_joints]
     M_inv, J, ee_tmat = robot.dynamically_consistent_velocity_control_matrices(q)
@@ -150,85 +143,105 @@ def compute_velocity_control(
     des_rot = jnp.reshape(z_ee_des[3:12], (3, 3))
     des_vel = z_ee_des[12:15]
     des_omega = z_ee_des[15:18]
-    # Set nullspace desired joint position
-    des_q = jnp.array(
-        [
-            0.0,
-            -jnp.pi / 6,
-            0.0,
-            -3 * jnp.pi / 4,
-            0.0,
-            5 * jnp.pi / 9,
-            0.0,
-        ]
-    )
     u_nom = osc_controller(
-        q, pos, rot, des_pos, des_rot, des_vel, des_omega, des_q, J, M_inv
+        q, pos, rot, des_pos, des_rot, des_vel, des_omega, jnp.asarray(posture), J, M_inv
     )
     return cbf.safety_filter(q, u_nom)
 
 
-def main(control_method="torque"):
-    assert control_method in ["torque", "velocity"]
+class ManualTarget:
+    """Three base-frame displacement sliders for the red target."""
 
-    robot = load_panda()
-    pos_min = (0.25, -0.25, 0.25)
-    pos_max = (0.65, 0.25, 0.65)
+    def __init__(self, env, origin, orientation):
+        self.env = env
+        self.origin = np.asarray(origin)
+        self.position = self.origin.copy()
+        self.orientation = orientation
+        client = env.client
+        client.configureDebugVisualizer(client.COV_ENABLE_GUI, 1)
+        for preview in (client.COV_ENABLE_RGB_BUFFER_PREVIEW, client.COV_ENABLE_DEPTH_BUFFER_PREVIEW,
+                        client.COV_ENABLE_SEGMENTATION_MARK_PREVIEW):
+            client.configureDebugVisualizer(preview, 0)
+        self.sliders = []
+        for axis, width in zip("XYZ", env.xyz_max - env.xyz_min):
+            limit_mm = 1000 * width
+            self.sliders.append(client.addUserDebugParameter(
+                f"Target {axis} (mm)", -limit_mm, limit_mm, 0.
+            ))
 
-    # NOTE: This term has a noticeable impact on the performance for this demo.
-    # It's often neglected due to computational demands and model error
+    def read(self):
+        offsets_mm = np.array([self.env.client.readUserDebugParameter(i) for i in self.sliders])
+        goal = self.origin + 0.001 * offsets_mm
+        delta = goal - self.position
+        # Limit target speed even when a slider moves from end to end in one frame.
+        distance = np.linalg.norm(delta)
+        step = delta * min(1., 0.08 * self.env.dt / distance) if distance else delta
+        self.position = self.position + step
+        return self.env.set_target_state(
+            self.position, self.orientation, step / self.env.dt, np.zeros(3)
+        )
+
+
+def main(control_method="torque", robot_name="panda", headless=False, steps=None, target=None):
+    if control_method not in ("torque", "velocity") or robot_name not in ("panda", "nero"):
+        raise ValueError("Unsupported robot or control method")
+    if steps is not None and steps < 1:
+        raise ValueError("steps must be positive")
+
+    if target is None:
+        target = "manual" if robot_name == "nero" and not headless else "trajectory"
+    if target not in ("manual", "trajectory"):
+        raise ValueError("Unsupported target mode")
+    if target == "manual" and headless:
+        raise ValueError("Manual target sliders require a PyBullet GUI")
+
+    if robot_name == "nero":
+        robot = load_nero()
+        posture = NERO_READY
+        tf = np.asarray(robot.ee_transform(np.asarray(posture)))
+        origin, orientation = tf[:3, 3], tf[:3, :3]
+        half_width = np.array([0.04, 0.08, 0.08])
+        pos_min, pos_max = origin - half_width, origin + half_width
+        amplitude = (0.08, 0, 0)
+        torque_limits = MIT_LIMIT
+        camera_target = origin * 0.5
+    else:
+        robot = load_panda()
+        posture = PANDA_POSTURE
+        pos_min, pos_max = (0.25, -0.25, 0.25), (0.65, 0.25, 0.65)
+        origin, orientation = (0.55, 0, 0.45), np.diag([1., -1., -1.])
+        amplitude = (0.25, 0, 0)
+        torque_limits = None
+        camera_target = (0.44, 0.16, 0.28)
+
     compensate_centrifugal_coriolis = False
-
-    torque_config = EESafeSetTorqueConfig(
-        robot,
-        pos_min,
-        pos_max,
-        compensate_centrifugal_coriolis=compensate_centrifugal_coriolis,
-    )
-    torque_cbf = CBF.from_config(torque_config)
-    velocity_config = EESafeSetVelocityConfig(robot, pos_min, pos_max)
-    velocity_cbf = CBF.from_config(velocity_config)
-    traj = SinusoidalTaskTrajectory(
-        init_pos=(0.55, 0, 0.45),
-        init_rot=np.array(
-            [
-                [1, 0, 0],
-                [0, -1, 0],
-                [0, 0, -1],
-            ]
-        ),
-        amplitude=(0.25, 0, 0),
-        angular_freq=(5, 0, 0),
-        phase=(0, 0, 0),
-    )
-    timestep = 1 / 1000
-    bg_color = (1, 1, 1)
     if control_method == "torque":
-        env = FrankaTorqueControlEnv(
-            torque_config.pos_min,
-            torque_config.pos_max,
-            traj=traj,
-            real_time=True,
-            bg_color=bg_color,
-            load_floor=False,
-            timestep=timestep,
+        config = EESafeSetTorqueConfig(
+            robot, pos_min, pos_max, compensate_centrifugal_coriolis, torque_limits
         )
     else:
-        env = FrankaVelocityControlEnv(
-            velocity_config.pos_min,
-            velocity_config.pos_max,
-            traj=traj,
-            real_time=True,
-            bg_color=bg_color,
-            load_floor=False,
-            timestep=timestep,
+        config = EESafeSetVelocityConfig(robot, pos_min, pos_max)
+    cbf = CBF.from_config(config)
+    traj = SinusoidalTaskTrajectory(
+        init_pos=origin, init_rot=orientation, amplitude=amplitude,
+        angular_freq=(5, 0, 0), phase=(0, 0, 0),
+    )
+    env_options = dict(
+        xyz_min=pos_min, xyz_max=pos_max, traj=traj if target == "trajectory" else None, real_time=not headless,
+        gui=not headless, bg_color=(1, 1, 1), load_floor=False, timestep=0.001,
+    )
+    if robot_name == "nero":
+        env = ManipulationEnv(
+            str(NERO_FLANGE_URDF), control_method, q_init=posture, target_pos=origin,
+            tau_max=np.asarray(torque_limits), qdot_max=np.asarray(robot.joint_max_velocities),
+            motor_friction=0., merge_fixed_links=False, target_scale=0.045, **env_options,
         )
+    else:
+        env_type = FrankaTorqueControlEnv if control_method == "torque" else FrankaVelocityControlEnv
+        env = env_type(**env_options)
 
     env.client.resetDebugVisualizerCamera(
-        cameraDistance=1.00,
-        cameraYaw=12,
-        cameraPitch=-2.6,
-        cameraTargetPosition=(0.44, 0.16, 0.28),
+        cameraDistance=1.00, cameraYaw=12, cameraPitch=-2.6, cameraTargetPosition=camera_target
     )
 
     kp_pos = 50.0
@@ -263,16 +276,17 @@ def main(control_method="torque"):
         return compute_torque_control(
             robot,
             osc_torque_controller,
-            torque_cbf,
+            cbf,
             compensate_centrifugal_coriolis,
             z,
             z_ee_des,
+            posture,
         )
 
     @jax.jit
     def compute_velocity_control_jit(z, z_ee_des):
         return compute_velocity_control(
-            robot, osc_velocity_controller, velocity_cbf, z, z_ee_des
+            robot, osc_velocity_controller, cbf, z, z_ee_des, posture
         )
 
     if control_method == "torque":
@@ -282,12 +296,44 @@ def main(control_method="torque"):
     else:
         raise ValueError(f"Invalid control method: {control_method}")
 
-    while True:
-        q_qdot = env.get_joint_state()
-        z_zdot_ee_des = env.get_desired_ee_state()
-        tau = compute_control(q_qdot, z_zdot_ee_des)
-        env.apply_control(tau)
-        env.step()
+    read_target = env.get_desired_ee_state
+    if target == "manual":
+        read_target = ManualTarget(env, origin, orientation).read
+        print("Move Target X/Y/Z (mm) in the PyBullet Parameters panel.", flush=True)
+
+    reference_excess = 0.0
+    flange_excess = 0.0
+    min_x, max_x = np.inf, -np.inf
+
+    def box_excess(pos):
+        return max(0., np.max(pos_min - pos), np.max(pos - pos_max))
+
+    try:
+        iterations = count() if steps is None else range(steps)
+        for _ in iterations:
+            if not env.client.isConnected():
+                break
+            state = env.get_joint_state()
+            desired = read_target()
+            command = np.asarray(compute_control(state, desired))
+            if not np.isfinite(command).all():
+                raise RuntimeError(f"Nonfinite {control_method} command at t={env.t:.3f} s")
+            env.apply_control(command)
+            env.step()
+            if steps is not None:
+                flange = np.asarray(robot.ee_position(env.get_joint_state()[:robot.num_joints]))
+                if not np.isfinite(flange).all():
+                    raise RuntimeError(f"Nonfinite flange position at t={env.t:.3f} s")
+                min_x, max_x = min(min_x, flange[0]), max(max_x, flange[0])
+                reference_excess = max(reference_excess, box_excess(desired[:3]))
+                flange_excess = max(flange_excess, box_excess(flange))
+        if min_x <= max_x:
+            print(f"{robot_name} {control_method}, {env.t:.3f} s: max distance outside a box face "
+                  f"(target / flange) = {reference_excess * 1000:.3f} / {flange_excess * 1000:.3f} mm, "
+                  f"flange x travel = {(max_x - min_x) * 1000:.2f} mm")
+    finally:
+        if env.client.isConnected():
+            env.client.disconnect()
 
 
 if __name__ == "__main__":
@@ -301,5 +347,12 @@ if __name__ == "__main__":
         default="torque",
         help="Control method to use (default: torque)",
     )
+    parser.add_argument("--robot", choices=["panda", "nero"], default="panda")
+    parser.add_argument("--headless", action="store_true", help="Run PyBullet without a GUI.")
+    parser.add_argument("--steps", type=int, help="Stop after this many 1 ms steps and report box violations.")
+    parser.add_argument("--target", choices=["manual", "trajectory"],
+                        help="Nero GUI defaults to manual XYZ sliders; headless runs use the trajectory.")
     args = parser.parse_args()
-    main(control_method=args.control_method)
+    if args.target == "manual" and args.headless:
+        parser.error("--target manual requires a GUI; omit --headless")
+    main(args.control_method, args.robot, args.headless, args.steps, args.target)

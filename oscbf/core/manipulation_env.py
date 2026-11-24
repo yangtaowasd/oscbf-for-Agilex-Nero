@@ -67,6 +67,10 @@ class ManipulationEnv:
         real_time: bool = False,
         timestep: float = 1 / 240,
         load_table: bool = False,
+        gui: bool = True,
+        motor_friction: float = 0.1,
+        merge_fixed_links: bool = True,
+        target_scale: float = 0.2,
     ):
         assert isinstance(urdf, str)
         self.urdf = urdf
@@ -75,7 +79,7 @@ class ManipulationEnv:
         assert isinstance(traj, TaskTrajectory) or traj is None
         self.traj = traj
         with stdout_redirected():
-            self.client: pybullet = BulletClient(pybullet.GUI)
+            self.client: pybullet = BulletClient(pybullet.GUI if gui else pybullet.DIRECT)
         assert isinstance(timestep, float) and timestep > 0
         self.client.setTimeStep(timestep)
         self.client.setAdditionalSearchPath(pybullet_data.getDataPath())
@@ -83,7 +87,7 @@ class ManipulationEnv:
             urdf,
             useFixedBase=True,
             flags=self.client.URDF_USE_INERTIA_FROM_FILE
-            | self.client.URDF_MERGE_FIXED_LINKS,
+            | (self.client.URDF_MERGE_FIXED_LINKS if merge_fixed_links else 0),
         )
         assert isinstance(load_table, bool)
         table_z_offset = -0.35
@@ -103,19 +107,24 @@ class ManipulationEnv:
         if bg_color is not None:
             assert len(bg_color) == 3
             self.client.configureDebugVisualizer(rgbBackground=bg_color)
-        self.num_joints = self.client.getNumJoints(self.robot)
+        num_links = self.client.getNumJoints(self.robot)
+        self.joint_indices = [
+            i for i in range(num_links)
+            if self.client.getJointInfo(self.robot, i)[2] != self.client.JOINT_FIXED
+        ]
+        self.num_joints = len(self.joint_indices)
         # "Unlock" the joints
         self.client.setJointMotorControlArray(
             self.robot,
-            list(range(self.num_joints)),
+            self.joint_indices,
             pybullet.VELOCITY_CONTROL,
-            forces=[0.1] * self.num_joints,
+            forces=[motor_friction] * self.num_joints,
         )
         self.target = self.client.loadURDF(
             str(ASSETS_DIR / "point_robot.urdf"),
             basePosition=target_pos,
             # baseOrientation=self.client.getQuaternionFromEuler([np.pi, 0, 0]),
-            globalScaling=0.2,
+            globalScaling=target_scale,
         )
         self.target_mass = 1.0
         self.client.changeVisualShape(self.target, -1, rgbaColor=[1, 0, 0, 0.6])
@@ -127,7 +136,7 @@ class ManipulationEnv:
             self.xyz_max = np.asarray(xyz_max)
             assert self.xyz_min.shape == self.xyz_max.shape == (3,)
             self.box_id = visualize_3D_box(
-                [self.xyz_min, self.xyz_max], rgba=(0, 1, 0, 0.3)
+                [self.xyz_min, self.xyz_max], rgba=(0, 1, 0, 0.3), client=self.client
             )
         else:
             self.box_id = None
@@ -154,13 +163,13 @@ class ManipulationEnv:
         self.last_time = time.time()
 
         # Disable collisions for all links and base of the robot with the target
-        for i in range(-1, self.num_joints + 1):
+        for i in range(-1, num_links):
             self.client.setCollisionFilterPair(self.robot, self.target, i, -1, 0)
         disable_robot_floor_collisions = False
         disable_target_floor_collisions = True
         if load_floor:
             if disable_robot_floor_collisions:
-                for i in range(-1, self.num_joints + 1):
+                for i in range(-1, num_links):
                     self.client.setCollisionFilterPair(self.robot, self.floor, i, -1, 0)
             if disable_target_floor_collisions:
                 self.client.setCollisionFilterPair(self.floor, self.target, -1, -1, 0)
@@ -172,7 +181,7 @@ class ManipulationEnv:
             if disable_target_table_collisions:
                 self.client.setCollisionFilterPair(self.table, self.target, -1, -1, 0)
             if disable_robot_table_collisions:
-                for i in range(-1, self.num_joints + 1):
+                for i in range(-1, num_links):
                     self.client.setCollisionFilterPair(self.robot, self.table, i, -1, 0)
             # Add a stand for the robot
             self.robot_stand_id = visualize_3D_box(
@@ -182,9 +191,9 @@ class ManipulationEnv:
         # Set initial joint positions if provided
         if q_init is not None:
             assert len(q_init) == self.num_joints
-            for joint_index in range(len(q_init)):
+            for joint_index, angle in zip(self.joint_indices, q_init):
                 self.client.resetJointState(
-                    self.robot, joint_index, q_init[joint_index]
+                    self.robot, joint_index, angle
                 )
 
         # Handle collision info
@@ -227,7 +236,7 @@ class ManipulationEnv:
         joint_angles = []
         joint_velocities = []
         joint_states = self.client.getJointStates(
-            self.robot, list(range(self.num_joints))
+            self.robot, self.joint_indices
         )
         joint_angles = [joint_state[0] for joint_state in joint_states]
         joint_velocities = [joint_state[1] for joint_state in joint_states]
@@ -240,13 +249,7 @@ class ManipulationEnv:
             rot = self.traj.rotation(self.t).ravel()
             vel = self.traj.velocity(self.t)
             omega = self.traj.omega(self.t)
-            # Update the target's visuals to match the desired state
-            # HACK: Assume fixed rotation (TODO get a conversion function in here)
-            # quat = rotation_to_xyzw(rot.reshape(3, 3))
-            quat = np.array([0, 0, 0, 1])
-            self.client.resetBasePositionAndOrientation(self.target, pos, quat)
-            self.client.resetBaseVelocity(self.target, vel, omega)
-            return np.array([*pos, *rot, *vel, *omega])
+            return self.set_target_state(pos, rot, vel, omega)
         # Otherwise, respond to GUI inputs from the user
         pos, orn = self.client.getBasePositionAndOrientation(self.target)
         vel, omega = self.client.getBaseVelocity(self.target)
@@ -269,6 +272,12 @@ class ManipulationEnv:
         omega = np.zeros(3)
         return np.array([*pos, *rot, *vel, *omega])
 
+    def set_target_state(self, pos, rot, vel, omega):
+        """Display the spherical target and return the corresponding controller reference."""
+        self.client.resetBasePositionAndOrientation(self.target, pos, (0, 0, 0, 1))
+        self.client.resetBaseVelocity(self.target, vel, omega)
+        return np.concatenate((pos, np.ravel(rot), vel, omega))
+
     def apply_control(self, u: Array) -> None:
         if self.control_mode == "velocity":
             if self.qdot_max is not None:
@@ -276,7 +285,7 @@ class ManipulationEnv:
             if self.tau_max is not None:
                 self.client.setJointMotorControlArray(
                     self.robot,
-                    list(range(self.num_joints)),
+                    self.joint_indices,
                     self.client.VELOCITY_CONTROL,
                     targetVelocities=u,
                     forces=self.tau_max,
@@ -284,7 +293,7 @@ class ManipulationEnv:
             else:
                 self.client.setJointMotorControlArray(
                     self.robot,
-                    list(range(self.num_joints)),
+                    self.joint_indices,
                     self.client.VELOCITY_CONTROL,
                     targetVelocities=u,
                 )
@@ -293,7 +302,7 @@ class ManipulationEnv:
                 u = np.clip(u, -self.tau_max, self.tau_max)
             self.client.setJointMotorControlArray(
                 self.robot,
-                list(range(self.num_joints)),
+                self.joint_indices,
                 self.client.TORQUE_CONTROL,
                 forces=u,
             )
@@ -332,6 +341,7 @@ class FrankaTorqueControlEnv(ManipulationEnv):
         real_time=False,
         timestep=1 / 240,
         load_table=False,
+        gui=True,
     ):
         super().__init__(
             str(ASSETS_DIR / "franka_panda/panda.urdf"),
@@ -351,6 +361,7 @@ class FrankaTorqueControlEnv(ManipulationEnv):
             real_time=real_time,
             timestep=timestep,
             load_table=load_table,
+            gui=gui,
         )
 
 
@@ -372,6 +383,7 @@ class FrankaVelocityControlEnv(ManipulationEnv):
         real_time=False,
         timestep=1 / 240,
         load_table=False,
+        gui=True,
     ):
         super().__init__(
             str(ASSETS_DIR / "franka_panda/panda.urdf"),
@@ -391,6 +403,7 @@ class FrankaVelocityControlEnv(ManipulationEnv):
             real_time=real_time,
             timestep=timestep,
             load_table=load_table,
+            gui=gui,
         )
 
 

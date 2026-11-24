@@ -23,6 +23,30 @@ In general, this will be especialy useful for enforcing safety during **teleoper
 For more details and videos, check out the [project webpage](https://stanfordasl.github.io/oscbf/) as well as the [CBFpy documentation](https://danielpmorton.github.io/cbfpy/).
 
 
+## AgileX Nero 七轴法兰版
+
+在本机激活 `oscbf` 环境，从本仓库目录运行原项目的 `dynamic_motion` 示例，即可在 PyBullet 窗口观察 Nero。红球是法兰目标，绿色盒子是法兰位置的安全区域。Nero 图形窗口默认由你控制红球。拖动右侧 Parameters 面板里的 `Target X/Y/Z (mm)` 三个滑块，可以相对初始法兰位置沿基座三轴移动目标。滑块归零即可返回起点。红球以最高 8 cm/s 移向设定位置，法兰保持初始朝向并受安全盒约束。窗口可用 Ctrl+C 结束。
+
+```bash
+conda activate oscbf
+python -m oscbf.examples.dynamic_motion --robot nero --control_method torque
+```
+
+添加 `--target trajectory` 可回放原来的自动轨迹（x 方向振幅 8 cm、安全盒半宽 4 cm）。将 `torque` 改为 `velocity` 可以用相同场景比较速度控制。添加 `--headless --steps 3000` 可在无窗口模式下仿真 3 秒，输出目标和法兰的最大越界距离。该实验沿用原项目的末端安全盒约束。
+
+另一个独立示例用于七轴多约束控制器的跟踪验证：
+
+```bash
+python -m unittest test.test_nero_dynamics test.test_nero_control
+python -m oscbf.examples.nero --steps 1000
+```
+
+`load_nero()` 从随包提供的 URDF 创建固定底座、竖直安装、空载法兰模型。任务坐标系为 `flange_link`。示例从屈肘初姿出发，保持法兰方向，沿基座 y 轴做 2 cm 往返运动，每步 2 ms。仿真保留法兰固定关节，以使用与动力学对照测试相同的惯性参数。
+
+控制器用七轴总力矩跟踪位姿，用二次规划约束关节位置、速度、输入力矩、雅可比可操作度，以及七个运动连杆包络球的工作空间。默认工作空间在基座坐标下为 x/y 各 ±0.8 m、z 为 0 至 0.9 m。包络球用于工作空间边界，此配置未实现自碰撞或场景障碍物避让。安装夹爪、工具或负载后需更新惯性、碰撞几何和 TCP。
+
+ROS 2 仿真与实机接口见同级工作区的 [Nero 运行说明](../oscbf_hardware_ws/README.md#agilex-nero)。
+
 ## How do I use this?
 
 Check out the `examples/` folder for interactive demos in Pybullet! This is the best place to start

@@ -37,6 +37,9 @@ class OSCBFTorqueConfig(CBFConfig):
             terms in the robot dynamics. This term is often neglected (set to False). Defaults to True.
         init_args (tuple, optional): Optional initial seed for testing additional CBFpy barrier arguments.
             Defaults to ().
+        torque_limits (array-like, optional): Per-joint actuator torque caps in N·m.
+            The QP uses the smaller of these and the URDF effort limits.
+        relax_cbf (bool): Allow the CBF solver to relax inequalities. Defaults to True.
     """
 
     def __init__(
@@ -47,6 +50,8 @@ class OSCBFTorqueConfig(CBFConfig):
         joint_obj_weight: float = 1.0,
         compensate_centrifugal_coriolis: bool = True,
         init_args: tuple = (),
+        torque_limits=None,
+        relax_cbf: bool = True,
     ):
         assert isinstance(robot, Manipulator)
         assert isinstance(pos_obj_weight, (tuple, float)) and pos_obj_weight >= 0
@@ -70,11 +75,18 @@ class OSCBFTorqueConfig(CBFConfig):
             np.array([self.joint_space_obj_weight] * self.num_joints) ** 2
         )
 
+        limits = np.asarray(robot.joint_max_forces)
+        if torque_limits is not None:
+            requested = np.asarray(torque_limits)
+            if requested.shape != limits.shape or not np.all(np.isfinite(requested) & (requested > 0)):
+                raise ValueError("Expected a positive finite torque limit per joint")
+            limits = np.minimum(limits, requested)
         super().__init__(
             n=self.num_joints * 2,
             m=self.num_joints,
-            u_min=-np.asarray(robot.joint_max_forces),
-            u_max=np.asarray(robot.joint_max_forces),
+            u_min=-limits,
+            u_max=limits,
+            relax_cbf=relax_cbf,
             init_args=init_args,
         )
 

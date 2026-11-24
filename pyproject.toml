@@ -23,6 +23,7 @@ dependencies = [
     "networkx",
     "lxml",
     "trimesh",
+    "pycollada",
 ]
 
 [project.urls]
@@ -33,3 +34,13 @@ dev = ["pylint", "black"]
 
 [tool.setuptools.packages.find]
 exclude = ["artifacts", "images"]
+
+[tool.setuptools.package-data]
+"oscbf.assets" = [
+    "point_robot.urdf",
+    "nero/urdf/nero_with_flange_description.urdf",
+    "nero/meshes/*.stl",
+    "nero/meshes/dae/*.dae",
+    "franka_panda/*.urdf",
+    "franka_panda/meshes/*/*",
+]

@@ -906,6 +906,36 @@ class Manipulator:
         return M_inv, J, T
 
 
+NERO_FLANGE_URDF = ASSETS_DIR / "nero/urdf/nero_with_flange_description.urdf"
+NERO_READY = (0.0, 0.6, 0.3, 1.0, -0.4, 0.35, 0.1)
+
+
+def load_nero() -> Manipulator:
+    """Load the fixed-base Nero with the flange mounting face as its TCP."""
+    from xml.etree import ElementTree
+    from oscbf.utils.urdfpy.utils import parse_origin
+
+    flange = ElementTree.parse(NERO_FLANGE_URDF).find("joint[@name='flange_joint']")
+    # One enclosing sphere per moving link, in its URDF link frame. Each
+    # center is the collision STL bounding-box midpoint and each radius
+    # bounds the farthest vertex. Link 7 includes the fixed flange mesh.
+    centers = (
+        (0, -0.002, -0.0135), (0.00332, -0.09775, 0),
+        (-0.00032, 0, -0.08875), (0, -0.0365, 0),
+        (0, 0.00001, -0.08179), (-0.00123, -0.00212, -0.0001),
+        (0.01301, 0, -0.0235),
+    )
+    radii = (0.05790, 0.13728, 0.12100, 0.07663, 0.09805, 0.03658, 0.04036)
+    return Manipulator.from_urdf(
+        str(NERO_FLANGE_URDF),
+        ee_offset=parse_origin(flange),
+        collision_data={
+            "positions": tuple((c,) for c in centers),
+            "radii": tuple((r,) for r in radii),
+        },
+    )
+
+
 def load_panda() -> Manipulator:
     """Create a Manipulator object for the Franka Panda"""
 
