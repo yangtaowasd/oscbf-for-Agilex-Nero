@@ -19,13 +19,16 @@ from jax.typing import ArrayLike
 from cbfpy import CBF
 from oscbf.core.manipulator import Manipulator, NERO_FLANGE_URDF, NERO_READY, load_nero, load_panda
 from oscbf.core.manipulation_env import FrankaTorqueControlEnv, FrankaVelocityControlEnv, ManipulationEnv
-from oscbf.core.nero_control import MIT_LIMIT
+from oscbf.core.nero_control import (
+    MIT_LIMIT,
+    PostureRecovery,
+    manual_torque_control,
+    manual_velocity_control,
+)
+from oscbf.core.nero_collision_model import geometry_margins
 from oscbf.core.oscbf_configs import OSCBFTorqueConfig, OSCBFVelocityConfig
 from oscbf.utils.trajectory import SinusoidalTaskTrajectory
 from oscbf.utils.visualization import visualize_3D_sphere
-from oscbf.examples.nero_workspace import (
-    geometry_margins, manual_torque_control, manual_velocity_control, PostureRecovery,
-)
 from oscbf.core.controllers import (
     PoseTaskTorqueController,
     PoseTaskVelocityController,

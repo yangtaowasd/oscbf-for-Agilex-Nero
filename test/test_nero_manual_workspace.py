@@ -9,7 +9,12 @@ import trimesh
 from oscbf.core.controllers import PositionTaskTorqueController, PositionTaskVelocityController
 from oscbf.core.manipulator import load_nero, NERO_FLANGE_URDF
 from oscbf.examples import dynamic_motion as demo
-from oscbf.examples.nero_workspace import CAPSULE_STARTS, CAPSULE_ENDS, CAPSULE_RADII, PostureRecovery
+from oscbf.core.nero_collision_model import (
+    CAPSULE_STARTS,
+    CAPSULE_ENDS,
+    CAPSULE_RADII,
+)
+from oscbf.core.nero_control import PostureRecovery
 from oscbf.utils.urdfpy.utils import parse_origin
 
 

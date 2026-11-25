@@ -25,25 +25,25 @@ For more details and videos, check out the [project webpage](https://stanfordasl
 
 ## AgileX Nero 七轴法兰版
 
-在本机激活 `oscbf` 环境，从本仓库目录运行原项目的 `dynamic_motion` 示例，即可在 PyBullet 窗口观察 Nero。红球是法兰目标，绿色盒子是法兰位置的安全区域。Nero 图形窗口默认由你控制红球。拖动右侧 Parameters 面板里的 `Base X/Y/Z (mm)` 三个滑块，可以设置目标相对于底座原点的绝对坐标。滑块初值为启动时法兰的基座坐标。红球以最高 8 cm/s 移向设定位置，法兰朝向可随运动自动调整，机械臂受安全盒约束。窗口可用 Ctrl+C 结束。
+在本机激活 `oscbf` 环境，从本仓库目录运行原项目的 `dynamic_motion` 示例，即可在 PyBullet 窗口观察 Nero。红球是法兰目标，绿色盒子是法兰位置的安全区域。Nero 图形窗口默认由你控制红球。拖动右侧 Parameters 面板里的 `Base X/Y/Z (mm)` 三个滑块，可以设置目标相对于底座原点的绝对坐标。滑块初值为启动时法兰的基座坐标。红球以最高 8 cm/s 移向设定位置，法兰朝向可随运动自动调整，机械臂受安全盒约束。窗口可用 Ctrl+C 结束。首次启动需要等待 JAX 编译控制器。
 
-手动模式的绿色盒子覆盖基座坐标 X −470～470 mm、Y −250～250 mm、Z 150～570 mm，三个滑块均以底座原点为基准。当前 TCP 位于法兰安装面，要求其坐标模长 √(X²+Y²+Z²) < 700 mm。控制器对 TCP 采用 699 mm 球面边界，留出 1 mm 数值余量，TCP 的允许区域为盒子与球体的交集，控制器对第 3～7 连杆施加外形边界约束。J1～J5 使用按显示与碰撞网格拟合的胶囊体，额外余量为 0 mm。J6、J7 使用球体，基础半径分别由 36.58、40.36 mm 放大 10%，并各增加 6 mm 余量。包络体随关节姿态变化，肘部与末端外形均参与边界限制。红球可移到该区域外，机械臂由控制器限制在边界内。为便于操作越界目标，红球滑块在盒子各面外延伸 100 mm，范围为 X ±570 mm、Y ±350 mm、Z 50～670 mm。手动仿真以 TCP 约 (−400, −100, 400) mm 的屈肘姿态启动。法兰朝向允许自动调整，实际可达位置仍取决于关节构型与避障约束。
+手动模式的绿色盒子覆盖基座坐标 X −470～470 mm、Y −250～250 mm、Z 150～570 mm，三个滑块均以底座原点为基准。当前 TCP 位于法兰安装面，要求其坐标模长 √(X²+Y²+Z²) < 700 mm。控制器对 TCP 采用 699 mm 球面边界，留出 1 mm 数值余量，TCP 的允许区域为盒子与球体的交集，控制器对第 3～7 连杆施加外形边界约束。J1～J5 使用按显示与碰撞网格拟合的胶囊体，额外余量为 0 mm。J6、J7 使用球体，基础半径分别由 36.58、40.36 mm 放大 10%，并各增加 6 mm 余量，实际约束半径分别为 46.238 mm 和 50.396 mm。包络体随关节姿态变化，肘部与末端外形均参与边界限制。红球可移到该区域外，机械臂由控制器限制在边界内。为便于操作越界目标，红球滑块在盒子各面外延伸 100 mm，范围为 X ±570 mm、Y ±350 mm、Z 50～670 mm。手动仿真以 TCP 约 (−400, −100, 400) mm 的屈肘姿态启动。法兰朝向允许自动调整，实际可达位置仍取决于关节构型与避障约束。
 
-蓝色避障球位于底座坐标 (−300, 0, 250) mm，直径 70 mm。控制器对全部七个运动连杆的包络体施加避障约束，其中 J6、J7 预留 6 mm 间隙，J1～J5 的额外间隙为 0 mm。初始姿态已避开蓝球。
+蓝色避障球位于底座坐标 (−300, 0, 250) mm，直径 70 mm。控制器对全部七个运动连杆的包络体施加避障约束，其中 J6、J7 预留 6 mm 间隙，J1～J5 的额外间隙为 0 mm。初始姿态已避开蓝球。离散仿真和 QP 软约束会产生数值误差，已运行的极限测试中出现过约 0.027 mm 的包络数值越界，对应实际碰撞网格与蓝球仍有间隙。
 
-手动仿真采用位置优先控制，使用阻尼逆避免奇异附近的求逆放大。冗余关节根据边界间隙、关节限位和位置雅可比的可操作性主动调整姿态。关节上下限与位置雅可比的可操作性下限同时进入约束求解，蓝球和绿框限制参与同一控制循环。目标停止后若 TCP 持续停滞，控制器尝试在这些约束内重求关节姿态，并通过有限速的关节运动恢复跟踪。恢复过程允许 TCP 暂时偏离目标路径。
+手动仿真采用位置优先控制，使用阻尼逆避免奇异附近的求逆放大。冗余关节根据边界间隙、关节限位和位置雅可比的可操作性主动调整姿态。关节上下限与位置雅可比的可操作性下限同时进入约束求解，蓝球和绿框限制参与同一控制循环。目标停止后若 TCP 持续停滞，控制器尝试在这些约束内重求关节姿态，并通过有限速的关节运动恢复跟踪。恢复过程允许 TCP 暂时偏离目标路径。终端输出 `Nero posture recovery found a feasible solution` 时，表示已找到候选恢复姿态，最终到达情况仍受约束和恢复路径影响。
 
 ```bash
 conda activate oscbf
-python -m oscbf.examples.dynamic_motion --robot nero --control_method torque
+python -m oscbf.examples.dynamic_motion --robot nero --target manual --control_method torque
 ```
 
-添加 `--target trajectory` 可回放原来的自动轨迹（x 方向振幅 8 cm、安全盒半宽 4 cm）。将 `torque` 改为 `velocity` 可以用相同场景比较速度控制。添加 `--headless --steps 3000` 可在无窗口模式下仿真 3 秒，输出目标和法兰的最大越界距离。该实验沿用原项目的末端安全盒约束。
+将 `torque` 改为 `velocity` 可以用相同场景比较速度控制。将 `--target manual` 改为 `--target trajectory` 可回放自动轨迹（X 方向振幅 80 mm，局部安全盒半宽为 X 40、Y 80、Z 80 mm）。自动轨迹模式下添加 `--headless --steps 3000` 可在无窗口模式下仿真 3 秒，输出目标和法兰的最大越界距离。仿真步长为 1 ms，无窗口模式默认选择自动轨迹。
 
-另一个独立示例用于七轴多约束控制器的跟踪验证：
+以下命令运行回归测试和独立的七轴多约束位姿跟踪示例。
 
 ```bash
-python -m unittest test.test_nero_dynamics test.test_nero_control
+python -m unittest test.test_nero_manual_workspace test.test_nero_dynamics test.test_nero_control
 python -m oscbf.examples.nero --steps 1000
 ```
 
@@ -79,7 +79,7 @@ A virtual environment is optional, but highly recommended. For `pyenv` installat
 ```
 git clone https://github.com/stanfordasl/oscbf
 cd oscbf
-pip install -e .
+pip install -e . scipy
 ```
 
 Note: This code will work with most versions of `jax`, but there seems to have been a CPU slowdown introduced in version `0.4.32`. To avoid this, I use version `0.4.30`, which is the version indicated in this repo's `pyproject.toml` as well. However, feel free to use any version you like.
@@ -90,6 +90,12 @@ This has been tested on Python 3.10 and 3.11, on Ubuntu 22.04.
 ## Documentation
 
 See the CBFpy documentation, available at [this link](https://danielpmorton.github.io/cbfpy)
+
+Nero 手动仿真的入口、绿框范围、蓝球位置、TCP 距离限制与滑块参数位于演示模块。[dynamic_motion.py](oscbf/examples/dynamic_motion.py)
+
+连杆胶囊体、球体参数及各连杆余量位于碰撞模型模块。控制、姿态调整和停滞恢复位于 Nero 控制模块。[nero_collision_model.py](oscbf/core/nero_collision_model.py)、[nero_control.py](oscbf/core/nero_control.py)
+
+操作空间控制器与阻尼求逆实现位于控制器模块。手动仿真回归测试覆盖网格包络、初始约束、直臂姿态有限输出及恢复求解。[controllers.py](oscbf/core/controllers.py)、[test_nero_manual_workspace.py](test/test_nero_manual_workspace.py)
 
 
 ## Hardware / ROS2 
